@@ -22,60 +22,70 @@ def speech_to_text_synthesizer(audio_path: str, src_lang: str = "english"):
     return result
 
 # Step 2: Translation in ONE CALL
+CHUNK_SIZE = 10  # number of segments per LLM call
+
+def chunk_segments(segments, chunk_size=CHUNK_SIZE):
+    for i in range(0, len(segments), chunk_size):
+        yield segments[i:i+chunk_size]
+
 def translate_segments_with_context(result, dest_lang: str, model_id: str = "llama-3.3-70b-versatile"):
-    """
-    Translate the entire transcript + all segments in ONE LLM call,
-    ensuring context is preserved.
-    """
-    # Prepare prompt with segments + transcript
-    segments_text = "\n".join(
-        [f"[{seg['start']:.2f} - {seg['end']:.2f}] {seg['text']}" for seg in result["segments"]]
-    )
+    all_translated_segments = []
+    full_translated_text = ""
 
-    full_prompt = f"""
-            You are a professional translator. 
-            Your task is to translate the given transcript into {dest_lang}.
-            Make sure to preserve the meaning and context across the entire transcript.
-            Return the output in **valid JSON format only**, with exactly two top-level fields:
-            1. "segments" -> list of objects with "start", "end", "original_text", "translated_text".
-            2. "full_translated_text" -> the full transcript translated with context.
+    for chunk in chunk_segments(result["segments"]):
+        segments_text = "\n".join([f"[{seg['start']:.2f} - {seg['end']:.2f}] {seg['text']}" for seg in chunk])
 
-            DO NOT include any explanations or text outside of the JSON.
+        full_prompt = f"""
+        You are a professional translator. 
+        Translate the following transcript into {dest_lang}.
+        Return ONLY valid JSON with:
+        1. "segments" -> list of objects with "start", "end", "original_text", "translated_text"
+        2. "full_translated_text" -> the full translated text for this chunk
 
-            Here is the transcript with timestamps:
+        Transcript chunk:
+        {segments_text}
+        """
 
-            {segments_text}
+        completion = client.chat.completions.create(
+            model=model_id,
+            messages=[
+                {"role": "system", "content": "You are a professional translator."},
+                {"role": "user", "content": full_prompt}
+            ],
+            temperature=0.2,
+            max_completion_tokens=2000,
+            top_p=1,
+        )
 
-            Full transcript:
-            {result['text']}
-    """
+        response_text = completion.choices[0].message.content.strip()
 
-    completion = client.chat.completions.create(
-        model=model_id,  # using a valid supported model
-        messages=[
-            {"role": "system", "content": "You are a professional translator."},
-            {"role": "user", "content": full_prompt}
-        ],
-        temperature=0.2,
-        max_completion_tokens=3000,
-        top_p=1,
-    )
+        # Extract JSON safely
+        match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        if not match:
+            raise ValueError("LLM did not return valid JSON. Raw response:\n" + response_text)
 
-    response_text = completion.choices[0].message.content.strip()
+        json_str = match.group(0)
+        # Remove trailing commas
+        json_str = re.sub(r',(\s*[\]}])', r'\1', json_str)
+        # Replace single quotes
+        json_str = json_str.replace("'", '"')
+        # Fix incomplete end
+        if not json_str.endswith('}'):
+            last_brace = json_str.rfind('}')
+            json_str = json_str[:last_brace+1]
 
-    # Try to extract JSON substring
-    match = re.search(r"\{.*\}", response_text, re.DOTALL)
-    if not match:
-        raise ValueError("LLM did not return valid JSON. Raw response:\n" + response_text)
+        try:
+            chunk_result = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON: {e}\nResponse:\n{response_text}")
 
-    json_str = match.group(0)
+        all_translated_segments.extend(chunk_result["segments"])
+        full_translated_text += " " + chunk_result.get("full_translated_text", "")
 
-    try:
-        translated_output = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON: {e}\nResponse:\n{response_text}")
-
-    return translated_output
+    return {
+        "segments": all_translated_segments,
+        "full_translated_text": full_translated_text.strip()
+    }
 
 
 # Step 3: Full pipeline
@@ -83,5 +93,5 @@ def speech_to_text(src_lang: str, dest_lang: str, model_id: str = "llama-3.3-70b
     audio_path = Config.UPLOAD_FOLDER + "/input_audio.wav"
     result = speech_to_text_synthesizer(audio_path, src_lang)
     output = translate_segments_with_context(result, dest_lang, model_id=model_id)
-    print(output['segments'])
-    return output['segments']
+    print(output)
+    return output

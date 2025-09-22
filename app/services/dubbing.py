@@ -42,7 +42,7 @@ def video_dubbing(request):
     print(src, dest, voice)
     result = speech_to_text(src, dest)
 
-    text_to_speech(result, dest)
+    text_to_speech(result['segments'], dest)
 
     audio_path = os.path.join(Config.OUTPUT_FOLDER, "output_audio.wav")
     video_path = os.path.join(Config.UPLOAD_FOLDER, "input_video.mp4")
