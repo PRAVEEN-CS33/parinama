@@ -1,96 +1,126 @@
-import torch
+import os
 import soundfile as sf
-from parler_tts import ParlerTTSForConditionalGeneration
-from transformers import AutoTokenizer
+import numpy as np
+import tempfile
+from pydub import AudioSegment
+from gtts import gTTS 
+import librosa
+import pyrubberband as pyrb
 
-# Load model and tokenizers only once (global initialization)
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
-model_name = "ai4bharat/indic-parler-tts"
+from app.config import Config
 
-model = ParlerTTSForConditionalGeneration.from_pretrained(model_name).to(device)
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-description_tokenizer = AutoTokenizer.from_pretrained(model.config.text_encoder._name_or_path)
+# ---------- Supported Indic Languages ----------
+# gTTS language codes (supports many Indian languages)
+INDIC_MODELS = {
+    "hi": "hi",     # Hindi
+    "ta": "ta",     # Tamil
+    "te": "te",     # Telugu
+    "kn": "kn",     # Kannada
+    "ml": "ml",     # Malayalam
+    "bn": "bn",     # Bengali
+    "gu": "gu",     # Gujarati
+    "pa": "pa",     # Punjabi
+    "mr": "mr",     # Marathi
+    "or": "or",     # Odia
+    "as": "as"      # Assamese
+}
 
-
-def text_to_speech(
-    text: str,
-    output_path: str = "indic_tts_out.wav",
-    speaker: str = None,
-    emotion: str = None,
-    pitch: str = "moderate",
-    rate: str = "normal",
-    expressivity: str = "neutral",
-    background: str = "clear",
-    reverberation: str = "close",
-    accent: str = None,
-    quality: str = "very high quality",
-):
+def tts_thread(text: str, lang: str = "hi"):
     """
-    Generate speech from text using Indic Parler-TTS with full customization.
+    Generate speech using gTTS (Google TTS).
+    Args:
+        text (str): Input text
+        lang (str): Language code (hi, ta, te, kn, etc.)
+    Returns:
+        np.ndarray: audio array
+        int: sampling rate
+    """
+    if lang not in INDIC_MODELS:
+        raise ValueError(f"❌ Unsupported language: {lang}")
+
+    # Save gTTS output to temporary mp3
+    temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tts = gTTS(text=text, lang=INDIC_MODELS[lang])
+    tts.save(temp_out.name)
+
+    # Convert mp3 → wav → numpy
+    audio = AudioSegment.from_file(temp_out.name, format="mp3")
+    sr = audio.frame_rate
+    y = np.array(audio.get_array_of_samples()).astype(np.float32) / (2**15)
+
+    os.remove(temp_out.name)
+    return y, sr
+def stretch_to_duration(audio_arr, sr, target_dur):
+    """
+    Stretch/compress audio to match target duration using pyrubberband (pitch-preserving).
 
     Args:
-        text (str): Input text to convert to speech.
-        output_path (str): Path to save the output WAV file.
-        speaker (str): Specific speaker (e.g., "Rohit", "Divya", "Aditi").
-        emotion (str): Emotion (e.g., "Happy", "Sad", "Anger", "Neutral").
-        pitch (str): "low", "high", "moderate".
-        rate (str): "slow", "fast", "normal".
-        expressivity (str): "monotone", "expressive", "slightly expressive".
-        background (str): "clear", "slightly noisy".
-        reverberation (str): "close", "distant".
-        accent (str): Optionally specify accent (e.g., "Indian English", "British").
-        quality (str): "basic", "refined", "very high quality".
+        audio_arr (np.ndarray): Input audio array (mono)
+        sr (int): Sampling rate
+        target_dur (float): Desired duration in seconds
 
     Returns:
-        str: Path to saved audio file.
+        np.ndarray: Stretched audio array
     """
+    cur_dur = len(audio_arr) / sr
+    if cur_dur <= 0 or target_dur <= 0:
+        return audio_arr
 
-    # Build description dynamically
-    description_parts = []
+    # Convert to mono if needed
+    if audio_arr.ndim > 1:
+        audio_arr = np.mean(audio_arr, axis=1)
 
-    if speaker:
-        description_parts.append(f"{speaker}'s voice")
+    # Compute stretch rate
+    rate = cur_dur / target_dur
 
-    if emotion:
-        description_parts.append(f"with a {emotion.lower()} tone")
+    # Stretch using rubberband (pitch-preserving)
+    y_stretched = pyrb.time_stretch(audio_arr, sr, rate)
 
-    if rate:
-        description_parts.append(f"speaks at a {rate} pace")
+    # Ensure float32
+    y_stretched = y_stretched.astype(np.float32)
+    return y_stretched
 
-    if pitch:
-        description_parts.append(f"with a {pitch} pitch")
+def text_to_speech(data, lang="hi"):
+    """
+    Convert segmented text data to aligned audio file (gTTS-based).
+    Args:
+        data (list): list of dicts with {t_word, start, end}
+        lang (str): language code
+    Returns:
+        str: path to final wav file
+    """
+    if lang not in INDIC_MODELS:
+        raise ValueError(f"❌ Language {lang} not supported. Choose from {list(INDIC_MODELS.keys())}")
 
-    if expressivity:
-        description_parts.append(f"in a {expressivity} style")
+    out_path = os.path.join(Config.OUTPUT_FOLDER, "output_audio.wav")
+    final = AudioSegment.silent(duration=0)
 
-    if reverberation:
-        description_parts.append(f"in a {reverberation}-sounding environment")
+    for i, seg in enumerate(data):
+        txt = seg["translated_text"]
+        start, end = seg["start"], seg["end"]
+        target_dur = end - start
 
-    if background:
-        description_parts.append(f"with {background} background noise")
+        # Generate audio
+        audio_arr, sr = tts_thread(txt, lang=lang)
 
-    if accent:
-        description_parts.append(f"and an {accent} accent")
+        # Stretch/compress to sync with original timing
+        y = stretch_to_duration(audio_arr, sr, target_dur)
 
-    if quality:
-        description_parts.append(f"recorded in {quality} audio")
+        temp_wav = os.path.join(Config.UPLOAD_FOLDER, f"seg_{i}.wav")
+        sf.write(temp_wav, y, sr)
 
-    description = ", ".join(description_parts)
+        segment_audio = AudioSegment.from_wav(temp_wav)
+        final += segment_audio
 
-    # Tokenize inputs
-    description_inputs = description_tokenizer(description, return_tensors="pt").to(device)
-    prompt_inputs = tokenizer(text, return_tensors="pt").to(device)
+        # Handle gap between segments
+        if i < len(data) - 1:
+            gap = data[i+1]["start"] - end
+            if gap > 0:
+                final += AudioSegment.silent(duration=gap*1000)
 
-    # Generate audio
-    generation = model.generate(
-        input_ids=description_inputs.input_ids,
-        attention_mask=description_inputs.attention_mask,
-        prompt_input_ids=prompt_inputs.input_ids,
-        prompt_attention_mask=prompt_inputs.attention_mask,
-    )
+        os.remove(temp_wav)
+        print(f"✅ {txt[:30]}... ({lang}) -> {target_dur:.2f}s")
 
-    audio_arr = generation.cpu().numpy().squeeze()
-    sf.write(output_path, audio_arr, model.config.sampling_rate)
-
-    print(f"✅ Audio saved at: {output_path}")
-    return output_path
+    final.export(out_path, format="wav")
+    print(f"🎵 Final synced audio saved: {out_path}")
+    return out_path
